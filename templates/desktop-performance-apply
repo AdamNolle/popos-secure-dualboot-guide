@@ -1,0 +1,31 @@
+#!/usr/bin/python3
+"""Apply and verify the desktop profile; tolerate only unsupported SATA PM."""
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+result = subprocess.run(['/usr/bin/system76-power', 'profile', 'performance'],
+                        text=True, capture_output=True)
+if result.returncode:
+    errors = [line.strip() for line in (result.stdout + result.stderr).splitlines()
+              if line.strip().startswith('- ')]
+    optional = r'- failed to set scsi host profiles: failed to set link time power management policy \S+ on host\d+: Operation not supported \(os error 95\)'
+    if not errors or not all(re.fullmatch(optional, error) for error in errors):
+        sys.stderr.write(result.stdout + result.stderr)
+        raise SystemExit(result.returncode)
+    print('SATA controller lacks the requested power-management feature; checking the applied CPU profile.')
+
+profile = subprocess.check_output(['/usr/bin/system76-power', 'profile'], text=True)
+if 'Power Profile: Performance' not in profile:
+    raise SystemExit('Performance profile was not applied.')
+governors = list(Path('/sys/devices/system/cpu').glob('cpu[0-9]*/cpufreq/scaling_governor'))
+if not governors or any(path.read_text().strip() != 'performance' for path in governors):
+    raise SystemExit('CPU performance governor was not applied to every CPU.')
+for path in Path('/sys/devices/system/cpu').glob('cpu[0-9]*/cpufreq/energy_performance_preference'):
+    if path.read_text().strip() != 'performance':
+        raise SystemExit('CPU performance preference was not applied.')
+boost = Path('/sys/devices/system/cpu/cpufreq/boost')
+if boost.exists() and boost.read_text().strip() != '1':
+    raise SystemExit('CPU boost is not enabled.')
+print('Verified Performance profile, all CPU governors/preferences, and CPU boost.')

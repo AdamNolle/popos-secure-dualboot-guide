@@ -1,0 +1,23 @@
+#!/bin/sh
+# Enable module enforcement before udev, only when firmware Secure Boot is on.
+case "${1:-}" in
+    prereqs) exit 0 ;;
+esac
+
+efi_vars=/sys/firmware/efi/efivars
+[ -d "$efi_vars" ] || exit 0
+if [ ! -f "$efi_vars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c" ]; then
+    mount -t efivarfs efivarfs "$efi_vars" 2>/dev/null || exit 0
+fi
+# Read through a pipe: BusyBox od's seek skips incorrectly on efivarfs files.
+secure_boot=$(cat "$efi_vars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c" 2>/dev/null | od -An -tu1 -j4 -N1 | tr -d ' \n')
+[ "$secure_boot" = 1 ] || exit 0
+
+if [ ! -f /sys/kernel/security/lockdown ]; then
+    mount -t securityfs securityfs /sys/kernel/security 2>/dev/null || exit 1
+fi
+if grep -Eq '\[(integrity|confidentiality)\]' /sys/kernel/security/lockdown; then
+    exit 0
+fi
+echo integrity > /sys/kernel/security/lockdown || exit 1
+echo "local-secure-boot: integrity lockdown enabled before udev" > /dev/kmsg

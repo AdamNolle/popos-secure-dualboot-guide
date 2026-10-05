@@ -1,0 +1,178 @@
+#!/usr/bin/python3
+"""Keep this Pop!_OS machine's EFI kernels and DKMS modules signed."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+STATE = Path('/var/lib/local-secure-boot')
+ESP = Path('/boot/efi')
+BOOT = Path('/boot')
+KEY = STATE / 'MOK.key'
+PEM = STATE / 'MOK.pem'
+DER = STATE / 'MOK.der'
+SIGNER = '@SIGNER_CN@'
+ESP_PARTUUID = '@LINUX_ESP_PARTUUID@'
+REBUILD_ENV = 'LOCAL_SECURE_BOOT_REBUILD'
+
+def run(args, **kwargs):
+    return subprocess.run([str(a) for a in args], check=True, **kwargs)
+
+def sign_efi(path):
+    if subprocess.run(['sbverify', '--cert', str(PEM), str(path)],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        return
+    with tempfile.TemporaryDirectory(dir=STATE) as tmp:
+        signed = Path(tmp) / 'signed.efi'
+        run(['sbsign', '--key', KEY, '--cert', PEM, '--output', signed, path])
+        run(['sbverify', '--cert', PEM, signed])
+        # Rename within the target filesystem, preserving the original until verified.
+        target = path.with_name(path.name + '.local-signed')
+        target.write_bytes(signed.read_bytes())
+        target.chmod(path.stat().st_mode & 0o777)
+        os.replace(target, path)
+
+def sign_modules():
+    changed_versions = []
+    for directory in sorted(Path('/lib/modules').iterdir()):
+        sign_file = Path('/usr/src') / ('linux-headers-' + directory.name) / 'scripts/sign-file'
+        if not sign_file.exists():
+            continue
+        changed = False
+        for module in sorted((directory / 'updates/dkms').glob('*.ko*')):
+            current = subprocess.check_output(['modinfo', '-F', 'signer', str(module)], text=True).strip()
+            if current == SIGNER:
+                continue
+            with tempfile.TemporaryDirectory(dir=STATE) as tmp:
+                plain = Path(tmp) / 'module.ko'
+                if module.suffix == '.zst':
+                    with plain.open('wb') as stream:
+                        run(['zstd', '-q', '-d', '-c', module], stdout=stream)
+                elif module.suffix == '.xz':
+                    with plain.open('wb') as stream:
+                        run(['xz', '-d', '-c', module], stdout=stream)
+                elif module.suffix == '.gz':
+                    with plain.open('wb') as stream:
+                        run(['gzip', '-d', '-c', module], stdout=stream)
+                else:
+                    plain.write_bytes(module.read_bytes())
+                run([sign_file, 'sha256', KEY, DER, plain])
+                assert subprocess.check_output(['modinfo', '-F', 'signer', str(plain)], text=True).strip() == SIGNER
+                target = module.with_name(module.name + '.local-signed')
+                with target.open('wb') as stream:
+                    if module.suffix == '.zst':
+                        run(['zstd', '-q', '-c', plain], stdout=stream)
+                    elif module.suffix == '.xz':
+                        run(['xz', '-c', plain], stdout=stream)
+                    elif module.suffix == '.gz':
+                        run(['gzip', '-c', plain], stdout=stream)
+                    else:
+                        stream.write(plain.read_bytes())
+                target.chmod(module.stat().st_mode & 0o777)
+                os.replace(target, module)
+                changed = True
+        if changed:
+            run(['depmod', '-a', directory.name])
+            changed_versions.append(directory.name)
+    return changed_versions
+
+def validate_esp():
+    mounts = json.loads(subprocess.check_output(
+        ['findmnt', '--json', '--mountpoint', str(ESP),
+         '--output', 'SOURCE,FSTYPE,OPTIONS'], text=True))['filesystems']
+    if len(mounts) != 1:
+        raise RuntimeError('Expected one mounted Linux EFI partition.')
+    mount = mounts[0]
+    partuuid = subprocess.check_output(
+        ['blkid', '-s', 'PARTUUID', '-o', 'value', mount['source']],
+        text=True).strip().lower()
+    if (partuuid != ESP_PARTUUID or mount['fstype'] != 'vfat'
+            or 'rw' not in mount['options'].split(',')):
+        raise RuntimeError('Linux EFI partition is missing, incorrect, or read-only.')
+
+def update_menu():
+    entry = ESP / 'loader/entries/Pop_OS-current.conf'
+    values = dict(line.split(None, 1) for line in entry.read_text().splitlines()
+                  if line.strip() and not line.lstrip().startswith('#'))
+    for field in ('linux', 'initrd', 'options'):
+        if field not in values or '"' in values[field] or '\n' in values[field]:
+            raise ValueError('Unexpected Pop kernel entry: ' + field)
+    if not (ESP / values['linux'].lstrip('/')).exists():
+        raise FileNotFoundError(values['linux'])
+    if not (ESP / values['initrd'].lstrip('/')).exists():
+        raise FileNotFoundError(values['initrd'])
+    config = '''timeout 20
+default_selection "Windows"
+scanfor manual
+use_nvram false
+menuentry "Windows" {
+ icon /EFI/refind/themes/cosmic-dark/icons/os_windows.png
+ volume @WINDOWS_ESP_PARTUUID@
+ loader /EFI/Microsoft/Boot/bootmgfw.efi
+ ostype Windows
+ graphics on
+}
+menuentry "Pop!_OS" {
+ icon /EFI/refind/themes/cosmic-dark/icons/os_linux.png
+ volume @LINUX_ESP_PARTUUID@
+ loader /EFI/systemd/systemd-bootx64.efi
+ ostype Linux
+ graphics on
+}
+include /EFI/refind/themes/cosmic-dark/theme.conf
+hideui singleuser,hints,arrows,badges
+showtools firmware,reboot,shutdown
+big_icon_size 192
+small_icon_size 48
+'''
+    if (STATE / 'boot-debug').exists():
+        config = 'log_level 1\n' + config
+    if (STATE / 'text-menu').exists():
+        config = config.replace('include /EFI/refind/themes/cosmic-dark/theme.conf\n', '')
+        config = config.replace(' graphics on', ' graphics off')
+        config = 'textonly\ntextmode 0\n' + config
+    destination = ESP / 'EFI/refind/refind.conf'
+    temp = destination.with_name('refind.conf.local-new')
+    temp.write_text(config)
+    os.replace(temp, destination)
+    # Both menus use Pop's distro loader. systemd-boot verifies signed kernels
+    # through shim when the Secure Boot entry starts this chain.
+    standard_directory = ESP / 'EFI/refind-standard'
+    if standard_directory.exists():
+        destination = standard_directory / 'refind.conf'
+        temp = destination.with_name('refind.conf.local-new')
+        temp.write_text(config)
+        os.replace(temp, destination)
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit('Run with sudo.')
+    # update-initramfs invokes our post-update hook again. The outer signer
+    # owns the lock and signs the resulting EFI files after that hook returns.
+    if os.environ.get(REBUILD_ENV) == '1':
+        return
+    with (STATE / 'signing.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        validate_esp()
+        changed_versions = sign_modules()
+        for kernel in sorted(BOOT.glob('vmlinuz-*')):
+            if kernel.is_file():
+                sign_efi(kernel)
+        for version in changed_versions:
+            if (BOOT / ('initrd.img-' + version)).is_file():
+                env = os.environ.copy()
+                env[REBUILD_ENV] = '1'
+                run(['update-initramfs', '-u', '-k', version], env=env)
+        for kernel in sorted((ESP / 'EFI').glob('Pop_OS-*/vmlinuz*.efi')):
+            sign_efi(kernel)
+        # Keep Pop's loader signed for shim validation and the direct fallback.
+        for loader in (ESP / 'EFI/systemd/systemd-bootx64.efi', ESP / 'EFI/BOOT/BOOTX64.EFI'):
+            if loader.exists():
+                sign_efi(loader)
+        update_menu()
+        os.sync()
+
+if __name__ == '__main__':
+    main()

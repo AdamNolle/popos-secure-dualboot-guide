@@ -1,0 +1,7 @@
+#!/bin/sh
+# Include the EFI-variable byte reader used by init-top lockdown enforcement.
+case "${1:-}" in
+    prereqs) exit 0 ;;
+esac
+. /usr/share/initramfs-tools/hook-functions
+copy_exec /usr/bin/od /usr/bin/od

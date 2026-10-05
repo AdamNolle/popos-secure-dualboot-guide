@@ -1,0 +1,22 @@
+# Private per-machine state and generated files
+/local/
+/reports/
+/backups/
+__pycache__/
+*.pyc
+*.key
+*.priv
+*.pem
+*.der
+*.p12
+*.pfx
+*.efi
+*.fd
+*.log
+*.log-old
+*.img
+*.iso
+*.tar
+*.tar.gz
+.env
+.env.*
